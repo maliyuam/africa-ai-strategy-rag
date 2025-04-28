@@ -1,0 +1,5 @@
+# packages.txt
+tesseract-ocr
+libtesseract-dev
+tesseract-ocr-eng # For English language pack
+tesseract-ocr-fra
