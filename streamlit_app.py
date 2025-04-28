@@ -24,7 +24,7 @@ load_dotenv()
 
 st.set_page_config(page_title="African AI Strategies Chat", layout="wide")
 st.title("💬 African AI & ICT Strategies Chatbot")
-st.caption("Chat about AI/ICT strategies (Handles Scanned PDFs | Re-ranking Accuracy | DB updated via Colab)")
+st.caption("Chat about AI/ICT strategies")
 
 # Secrets Management
 try:
@@ -133,7 +133,6 @@ easyocr_reader = get_easyocr_reader() # Initialize even if not used in UI
 # (Functions extract_text_from_pdf_stream, chunk_text, process_and_store_pdf
 #  are kept here, even though not called by the UI,
 #  in case you want to re-enable uploads later or use them differently)
-# ... (copy the full helper functions from two responses ago here) ...
 def extract_text_from_pdf_stream(pdf_stream):
     """
     Extracts text from a PDF file stream.
@@ -234,7 +233,6 @@ def process_and_store_pdf(pdf_stream, filename, country, year=None, source_url=N
 
     status_placeholder = st.sidebar.empty()
     progress_bar = st.sidebar.progress(0, text="Starting...")
-    # ... (rest of the function remains the same as previously) ...
     try:
         status_placeholder.info(f"Processing '{filename}'...")
         progress_bar.progress(5, text="Extracting text (incl. OCR)...")
@@ -287,19 +285,27 @@ def process_and_store_pdf(pdf_stream, filename, country, year=None, source_url=N
         st.spinner()
         return False
 
-# --- Custom Prompt Template ---
+# --- Enhanced Custom Prompt Template ---
 prompt_template = """
-You are an AI assistant specialized in analyzing African AI and ICT strategy documents.
-Use the following pieces of context retrieved from the documents to answer the question at the end.
+You are a highly specialized AI assistant expert in analyzing and synthesizing information from African AI and ICT strategy documents. Your primary function is to answer questions accurately and concisely based *exclusively* on the provided context. Maintain a professional and objective tone.
+
 Context:
+--- BEGIN CONTEXT ---
 {context}
+--- END CONTEXT ---
 
 Question: {question}
 
-Answer the question based *ONLY* on the provided context above.
-- If the context contains the answer, provide a clear and concise answer referencing the key information found.
-- If the context does *not* contain information relevant to the question, explicitly state: "Based on the provided documents, I cannot answer this question."
-- Do not add any information that is not present in the context. Do not make assumptions or provide external knowledge.
+Instructions for answering:
+1.  **Analyze the Context Thoroughly:** Carefully read all provided context chunks between the BEGIN and END markers.
+2.  **Answer ONLY from Context:** Base your entire answer *strictly* on the information found within the provided context. Do NOT use any external knowledge or make assumptions beyond what is explicitly stated in the text.
+3.  **Synthesize if Necessary:** If multiple context chunks provide relevant pieces of information, synthesize them into a coherent and unified answer. Avoid simply listing separate snippets unless the question specifically asks for distinct points.
+4.  **Direct Answer & Evidence:** Start with a direct answer to the question if possible. Support your answer by referencing the key information or evidence found in the context. Do not quote long passages unless the question requires it.
+5.  **Handle Insufficient Information:**
+    * If the context is relevant but does *not* fully answer the question, clearly state what information *is* available in the context and explicitly mention what parts of the question cannot be answered based on the provided text.
+    * If the context does *not* contain *any* relevant information to answer the question, state clearly: "Based on the provided documents, I cannot answer this question."
+6.  **Handle Conflicting Information:** If different parts of the context present conflicting information, acknowledge this discrepancy as found within the text.
+7.  **Conciseness and Clarity:** Be clear and concise. Avoid jargon where possible or explain it using the context if necessary. Structure the answer logically.
 
 Answer:"""
 CUSTOM_PROMPT = PromptTemplate(
@@ -322,8 +328,12 @@ def get_rag_response(query):
             scores = cross_encoder.predict(rerank_pairs)
             docs_with_scores = sorted(zip(initial_docs, scores), key=lambda x: x[1], reverse=True)
             re_ranked_docs = [doc for doc, score in docs_with_scores[:FINAL_RANKED_K]]
+
         context_str = "\n\n---\n\n".join([doc.page_content for doc in re_ranked_docs])
+
+        # Use the updated CUSTOM_PROMPT object
         formatted_prompt = CUSTOM_PROMPT.format(context=context_str, question=query)
+
         with st.spinner("Generating answer..."):
             response = llm.invoke(formatted_prompt)
             answer = response.content
@@ -374,18 +384,19 @@ if "messages" not in st.session_state:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        # Display sources associated with previous assistant messages (with key fix)
+        # Display sources associated with previous assistant messages
         if message["role"] == "assistant" and "sources" in message and message["sources"]:
             message_id = message.get("id")
             if message_id:
-                expander_key = f"expander_{message_id}"
-                with st.expander("Show sources used", key=expander_key):
+                # FIX 1 applied: Removed key argument
+                with st.expander("Show sources used"):
                     for i, doc in enumerate(message["sources"]):
                         source = doc.metadata.get('source', 'N/A')
                         country = doc.metadata.get('country', 'N/A')
                         year = doc.metadata.get('year', '')
                         chunk_idx = doc.metadata.get('chunk_index', '')
                         label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
+                        # Use unique key for text_area based on message ID and source index
                         source_key = f"src_hist_{message_id}_{i}"
                         st.text_area(label, doc.page_content, height=100, key=source_key)
 
@@ -413,18 +424,19 @@ if prompt := st.chat_input("Ask a question about the documents..." if status_ok 
             # Update placeholder with the actual answer
             response_placeholder.markdown(answer)
 
-            # Display sources for *this* response in an expander (using corrected key logic)
+            # Display sources for *this* response in an expander
             if sources:
-                expander_key = f"expander_{asst_msg_id}" # Use the message ID for key
-                with st.expander("Show sources used for this response", key=expander_key):
+                # FIX 2 applied: Removed key argument
+                with st.expander("Show sources used for this response"):
                     for i, doc in enumerate(sources):
-                         source = doc.metadata.get('source', 'N/A')
-                         country = doc.metadata.get('country', 'N/A')
-                         year = doc.metadata.get('year', '')
-                         chunk_idx = doc.metadata.get('chunk_index', '')
-                         label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
-                         source_key = f"src_{asst_msg_id}_{i}" # Use message ID for key
-                         st.text_area(label, doc.page_content, height=100, key=source_key)
+                        source = doc.metadata.get('source', 'N/A')
+                        country = doc.metadata.get('country', 'N/A')
+                        year = doc.metadata.get('year', '')
+                        chunk_idx = doc.metadata.get('chunk_index', '')
+                        label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
+                        # Use unique key for text_area based on message ID and source index
+                        source_key = f"src_{asst_msg_id}_{i}"
+                        st.text_area(label, doc.page_content, height=100, key=source_key)
 
         # Add assistant response and sources to chat history (using the same ID)
         st.session_state.messages.append({
@@ -433,6 +445,5 @@ if prompt := st.chat_input("Ask a question about the documents..." if status_ok 
             "sources": sources,
             "id": asst_msg_id
             })
-        # Rerun needed to potentially clear the chat_input after processing,
-        # but let's test without it first as it might cause issues with expander state.
-        # st.rerun()
+        # Optional: uncomment rerun if needed, but test first
+        st.rerun()
