@@ -13,7 +13,7 @@ from langchain_mongodb import MongoDBAtlasVectorSearch
 from langchain_core.documents import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import PromptTemplate
-from sentence_transformers import CrossEncoder
+from sentence_transformers import CrossEncoder # Import for re-ranking
 from dotenv import load_dotenv
 import tempfile
 import pandas
@@ -53,9 +53,7 @@ OCR_LANGUAGES = ['en']
 OCR_MIN_TEXT_LENGTH = 50
 
 # --- Caching Expensive Initializations ---
-# (get_mongo_client, initialize_openai_langchain, get_vector_store, get_cross_encoder, get_easyocr_reader)
-# (These cached functions remain unchanged from the previous EasyOCR version)
-# ... (copy the full cached functions here) ...
+
 @st.cache_resource(show_spinner="Connecting to MongoDB...")
 def get_mongo_client(uri):
     try:
@@ -73,9 +71,9 @@ def get_mongo_client(uri):
 def initialize_openai_langchain(api_key):
     try:
         if not api_key: raise ValueError("OpenAI API Key is empty.")
-        llm = ChatOpenAI(openai_api_key=api_key, model_name=LLM_MODEL, temperature=0.1) # Even lower temp
+        llm = ChatOpenAI(openai_api_key=api_key, model_name=LLM_MODEL, temperature=0.1)
         embeddings = OpenAIEmbeddings(openai_api_key=api_key, model=EMBEDDING_MODEL)
-        openai_client = OpenAI(api_key=api_key) # For potential direct use
+        openai_client = OpenAI(api_key=api_key)
         return llm, embeddings, openai_client
     except Exception as e:
         st.error(f"Error initializing OpenAI components: {e}")
@@ -114,18 +112,16 @@ def get_cross_encoder(model_name=CROSS_ENCODER_MODEL):
         st.info("Model might need to be downloaded. Ensure internet connection.")
         return None
 
-# --- NEW: Cache EasyOCR Reader ---
 @st.cache_resource(show_spinner="Loading OCR Model...")
 def get_easyocr_reader(langs=OCR_LANGUAGES, gpu=False):
     """Loads the EasyOCR reader and caches it."""
     try:
-        # You might need to adjust gpu=True if you have a compatible setup
-        reader = easyocr.Reader(langs, gpu=gpu)
-        # st.sidebar.success(f"EasyOCR Reader loaded ({', '.join(langs)}, GPU={gpu}).") # Keep sidebar clean
+        reader = easyocr.Reader(langs, gpu=gpu) # Note: gpu=True requires CUDA setup
+        # st.sidebar.success(f"EasyOCR Reader loaded ({', '.join(langs)}, GPU={gpu}).") # Keep sidebar cleaner
         return reader
     except Exception as e:
         st.error(f"Error loading EasyOCR Reader: {e}")
-        st.info("Ensure PyTorch is installed correctly. Try CPU mode (gpu=False).")
+        st.info("Ensure PyTorch is installed correctly. Try CPU mode (gpu=False). Check Tesseract dependency if using older EasyOCR.")
         return None
 
 # --- Initialize Clients ---
@@ -136,8 +132,7 @@ cross_encoder = get_cross_encoder()
 easyocr_reader = get_easyocr_reader()
 
 # --- Helper Functions ---
-# (extract_text_from_pdf_stream, chunk_text, process_and_store_pdf remain unchanged from EasyOCR version)
-# ... (copy the full functions here) ...
+
 def extract_text_from_pdf_stream(pdf_stream):
     """
     Extracts text from a PDF file stream.
@@ -151,6 +146,7 @@ def extract_text_from_pdf_stream(pdf_stream):
         st.warning("EasyOCR reader not loaded. OCR functionality will be skipped.")
 
     try:
+        # Save stream to a temporary file for PyMuPDF
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpfile:
             tmpfile.write(pdf_stream.read())
             tmp_pdf_path = tmpfile.name
@@ -160,35 +156,52 @@ def extract_text_from_pdf_stream(pdf_stream):
              st.warning("Uploaded PDF appears to be empty.")
              return ""
 
+        # Process pages
         page_texts = []
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            page_text = page.get_text("text").strip()
+            page_text = page.get_text("text").strip() # Extract text directly
 
+            # If direct text extraction yields very little, assume scanned and try OCR
             if easyocr_reader and (not page_text or len(page_text) < OCR_MIN_TEXT_LENGTH):
+                ocr_attempted_for_page = False
                 try:
-                    pix = page.get_pixmap(dpi=300)
-                    img_bytes = pix.tobytes("png")
+                    st.write(f"Page {page_num+1}: Low text detected, attempting OCR...") # Debug info
+                    # Render page to an image (pixmap)
+                    pix = page.get_pixmap(dpi=300) # Higher DPI for better OCR
+                    img_bytes = pix.tobytes("png") # Get image bytes
+
+                    # Convert bytes to PIL Image to numpy array for EasyOCR
                     pil_image = Image.open(io.BytesIO(img_bytes))
                     np_image = np.array(pil_image)
+
+                    # Perform OCR
                     ocr_results = easyocr_reader.readtext(np_image)
+                    ocr_attempted_for_page = True
+
+                    # Extract text from OCR results
                     ocr_text = " ".join([res[1] for res in ocr_results])
                     if ocr_text.strip():
                         page_texts.append(ocr_text.strip())
                         ocr_pages_count += 1
-                    elif page_text:
-                        page_texts.append(page_text)
+                        st.write(f"Page {page_num+1}: OCR successful.") # Debug info
+                    elif page_text: # If OCR failed but get_text had *some* text
+                        page_texts.append(page_text) # Use the original minimal text
+                        st.write(f"Page {page_num+1}: OCR yielded no text, using original minimal text.") # Debug info
+                    # Else: page is likely blank or OCR failed completely, append nothing
+
                 except Exception as ocr_err:
                      st.warning(f"OCR failed for page {page_num + 1}: {ocr_err}. Falling back to get_text() if available.")
-                     if page_text:
+                     if page_text: # Append original text if OCR failed
                          page_texts.append(page_text)
             else:
+                # Use directly extracted text if it's substantial enough
                 page_texts.append(page_text)
 
         doc.close()
-        os.remove(tmp_pdf_path)
+        os.remove(tmp_pdf_path) # Clean up temp file
 
-        full_doc_text = "\n\n".join(filter(None, page_texts))
+        full_doc_text = "\n\n".join(filter(None, page_texts)) # Join non-empty page texts
 
         if ocr_pages_count > 0:
             st.info(f"Used OCR to extract text from {ocr_pages_count} page(s).") # Show info in main area
@@ -205,6 +218,7 @@ def extract_text_from_pdf_stream(pdf_stream):
         st.error(f"Error extracting text from PDF stream: {e}")
         return None
     finally:
+        # Ensure temp file is cleaned up even if errors occur
         if tmp_pdf_path and os.path.exists(tmp_pdf_path):
             try: os.remove(tmp_pdf_path)
             except OSError: pass
@@ -231,25 +245,27 @@ def process_and_store_pdf(pdf_stream, filename, country, year=None, source_url=N
         st.error("Vector Store not initialized. Cannot process PDF.")
         return False
 
+    # Status updates in sidebar
     status_placeholder = st.sidebar.empty()
     progress_bar = st.sidebar.progress(0, text="Starting...")
 
     try:
         status_placeholder.info(f"Processing '{filename}'...")
         progress_bar.progress(5, text="Extracting text (incl. OCR)...")
-        with st.spinner("Extracting text (incl. OCR)..."):
+        # Use a spinner for the potentially long extraction step
+        with st.spinner("Extracting text (might take time if OCR is needed)..."):
             full_text = extract_text_from_pdf_stream(pdf_stream)
-            if full_text is None:
-                status_placeholder.empty(); progress_bar.empty(); return False
-            if not full_text:
-                 st.warning(f"No text found in '{filename}'. Skipping storage.")
-                 status_placeholder.empty(); progress_bar.empty(); return False
+
+        if full_text is None: # Explicit check for extraction errors
+            status_placeholder.error("Text extraction failed."); progress_bar.empty(); return False
+        if not full_text: # Handle empty but successful extraction
+             st.warning(f"No text found in '{filename}'. Skipping storage.")
+             status_placeholder.empty(); progress_bar.empty(); return False
 
         progress_bar.progress(20, text="Chunking text...")
-        with st.spinner("Chunking text..."):
-            text_chunks = chunk_text(full_text)
-            if not text_chunks:
-                st.error("No text chunks generated."); status_placeholder.empty(); progress_bar.empty(); return False
+        text_chunks = chunk_text(full_text)
+        if not text_chunks:
+            st.error("No text chunks generated."); status_placeholder.empty(); progress_bar.empty(); return False
 
         progress_bar.progress(30, text="Preparing documents...")
         documents = []
@@ -268,26 +284,25 @@ def process_and_store_pdf(pdf_stream, filename, country, year=None, source_url=N
             total_docs = len(documents)
             for i in range(0, total_docs, batch_size):
                  batch = documents[i:i + batch_size]
-                 ids = vector_store.add_documents(batch)
+                 ids = vector_store.add_documents(batch) # Assuming this handles potential API errors internally for now
                  inserted_ids.extend(ids)
-                 progress_percentage = min(40 + (i + batch_size) / total_docs * 60, 100)
-                 progress_text = f"Embedding & Storing Chunks... {int(progress_percentage)}%"
-                 progress_bar.progress(int(progress_percentage)/100, text=progress_text)
+                 progress_percentage = min(40 + int(((i + len(batch)) / total_docs) * 60), 100)
+                 progress_text = f"Embedding & Storing Chunks... {progress_percentage}%"
+                 progress_bar.progress(progress_percentage / 100, text=progress_text)
 
-        st.success(f"Successfully added {len(inserted_ids)} chunks from '{filename}'.")
-        progress_bar.empty(); status_placeholder.empty(); st.spinner()
+        st.sidebar.success(f"Processed '{filename}' ({len(inserted_ids)} chunks).") # Use sidebar for final success
+        progress_bar.empty(); status_placeholder.empty()
         return True
 
     except Exception as e:
-        st.error(f"An error occurred during PDF processing/storage: {e}"); st.exception(e)
-        status_placeholder.empty();
+        st.error(f"Error processing/storing PDF: {e}")
+        st.exception(e)
+        status_placeholder.empty()
         if 'progress_bar' in locals(): progress_bar.empty()
-        st.spinner()
         return False
 
 
 # --- Custom Prompt Template ---
-# (Unchanged)
 prompt_template = """
 You are an AI assistant specialized in analyzing African AI and ICT strategy documents.
 Use the following pieces of context retrieved from the documents to answer the question at the end.
@@ -302,30 +317,51 @@ Answer the question based *ONLY* on the provided context above.
 - Do not add any information that is not present in the context. Do not make assumptions or provide external knowledge.
 
 Answer:"""
-
 CUSTOM_PROMPT = PromptTemplate(
     template=prompt_template, input_variables=["context", "question"]
 )
 
 # --- RAG Function (incorporates re-ranking) ---
-# (Unchanged - takes query, returns answer and sources)
 def get_rag_response(query):
     """Performs RAG, Re-ranking, and LLM call."""
+    # Check if all required components are loaded
     if not all([vector_store, llm, cross_encoder]):
-        return "Error: Core AI components are not ready.", []
+        missing = [
+            comp_name for comp, comp_name in
+            zip([vector_store, llm, cross_encoder], ["Vector Store", "LLM", "Re-ranker"])
+            if comp is None
+        ]
+        return f"Error: Cannot perform query. Missing components: {', '.join(missing)}.", []
+
     try:
-        initial_docs = vector_store.similarity_search(query, k=INITIAL_RETRIEVAL_K)
+        # 1. Initial Retrieval
+        with st.spinner(f"Searching for top {INITIAL_RETRIEVAL_K} candidates..."):
+            initial_docs = vector_store.similarity_search(query, k=INITIAL_RETRIEVAL_K)
+
         if not initial_docs:
             return "I couldn't find any potentially relevant documents based on your query.", []
-        rerank_pairs = [(query, doc.page_content) for doc in initial_docs]
-        scores = cross_encoder.predict(rerank_pairs)
-        docs_with_scores = sorted(zip(initial_docs, scores), key=lambda x: x[1], reverse=True)
-        re_ranked_docs = [doc for doc, score in docs_with_scores[:FINAL_RANKED_K]]
+
+        # 2. Re-ranking
+        with st.spinner(f"Re-ranking {len(initial_docs)} candidates..."):
+            rerank_pairs = [(query, doc.page_content) for doc in initial_docs]
+            scores = cross_encoder.predict(rerank_pairs)
+            # Combine docs with scores and sort
+            docs_with_scores = sorted(zip(initial_docs, scores), key=lambda x: x[1], reverse=True)
+            # Select top K re-ranked documents
+            re_ranked_docs = [doc for doc, score in docs_with_scores[:FINAL_RANKED_K]]
+
+        # 3. Prepare Context & Prompt
         context_str = "\n\n---\n\n".join([doc.page_content for doc in re_ranked_docs])
         formatted_prompt = CUSTOM_PROMPT.format(context=context_str, question=query)
-        response = llm.invoke(formatted_prompt)
-        answer = response.content
+
+        # 4. Call LLM
+        with st.spinner("Generating answer based on re-ranked context..."):
+            response = llm.invoke(formatted_prompt)
+            answer = response.content
+
+        # Return answer and the documents used (after re-ranking)
         return answer, re_ranked_docs
+
     except Exception as e:
         st.error(f"An error occurred during the RAG process: {e}")
         st.exception(e)
@@ -334,109 +370,127 @@ def get_rag_response(query):
 
 # --- UI Components ---
 
-# Sidebar (Unchanged)
+# Sidebar Status and Config Display
 with st.sidebar:
     st.divider()
     st.subheader("System Status")
-    # Display status of components...
+    status_ok = True
     if mongo_client: st.success("MongoDB Connected")
-    else: st.error("MongoDB Disconnected")
+    else: st.error("MongoDB Disconnected"); status_ok = False
     if embeddings: st.success("Embeddings Initialized")
-    else: st.error("Embeddings Failed")
+    else: st.error("Embeddings Failed"); status_ok = False
     if llm: st.success("LLM Initialized")
-    else: st.error("LLM Failed")
+    else: st.error("LLM Failed"); status_ok = False
     if vector_store: st.success("Vector Store Ready")
-    else: st.error("Vector Store Failed")
+    else: st.error("Vector Store Failed"); status_ok = False
     if cross_encoder: st.success("Re-ranker Loaded")
-    else: st.error("Re-ranker Failed")
+    else: st.error("Re-ranker Failed"); status_ok = False
     if easyocr_reader: st.success("EasyOCR Reader Loaded")
-    else: st.error("EasyOCR Reader Failed")
+    else: st.error("EasyOCR Reader Failed"); status_ok = False # OCR is optional for querying but needed for ingestion of scans
     st.divider()
     st.subheader("Configuration")
-    if embeddings: st.info(f"Embedding: `{EMBEDDING_MODEL}`")
-    if llm: st.info(f"LLM: `{LLM_MODEL}`")
-    if cross_encoder: st.info(f"Re-ranker: `{CROSS_ENCODER_MODEL}`")
-    if easyocr_reader: st.info(f"OCR Languages: `{OCR_LANGUAGES}`")
+    if embeddings: st.write(f"**Embedding:** `{EMBEDDING_MODEL}`")
+    if llm: st.write(f"**LLM:** `{LLM_MODEL}`")
+    if cross_encoder: st.write(f"**Re-ranker:** `{CROSS_ENCODER_MODEL}`")
+    if easyocr_reader: st.write(f"**OCR Languages:** `{OCR_LANGUAGES}`")
     st.divider()
+
+# Sidebar for PDF Upload (with the AttributeError fix using file_id)
+with st.sidebar:
     st.header("📄 Add New Document")
     if 'uploader_key' not in st.session_state:
         st.session_state['uploader_key'] = 0
     uploaded_file = st.file_uploader("Upload PDF", type="pdf", key=f"uploader_{st.session_state['uploader_key']}")
+
     if uploaded_file is not None:
-        file_key_suffix = uploaded_file.id
-        country_name = st.text_input("Enter Country:", key=f"country_{file_key_suffix}")
-        doc_year_str = st.text_input("Enter Year (optional):", key=f"year_{file_key_suffix}")
-        doc_source_url = st.text_input("Enter Source URL (optional):", key=f"url_{file_key_suffix}")
-        if st.button("Process Document", key=f"process_{file_key_suffix}"):
-            if not all([vector_store, llm, embeddings, easyocr_reader]):
-                 st.error("Backend components not ready.")
-            elif not country_name: st.warning("Please enter the country name.")
+        current_file_id = uploaded_file.file_id # Use stable file_id
+        country_name = st.text_input("Enter Country:", key=f"country_{current_file_id}")
+        doc_year_str = st.text_input("Enter Year (optional):", key=f"year_{current_file_id}")
+        doc_source_url = st.text_input("Enter Source URL (optional):", key=f"url_{current_file_id}")
+
+        if st.button("Process Document", key=f"process_{current_file_id}"):
+            if not status_ok: # Check if backend is ready before processing
+                 st.error("Backend components not ready. Please check status.")
+            elif not country_name:
+                st.warning("Please enter the country name.")
             else:
                 year_val = int(doc_year_str) if doc_year_str.isdigit() else None
                 url_val = doc_source_url if doc_source_url else None
                 success = process_and_store_pdf(uploaded_file, uploaded_file.name, country_name, year_val, url_val)
                 if success:
-                    st.session_state['uploader_key'] += 1; st.rerun()
+                    st.session_state['uploader_key'] += 1
+                    st.rerun()
     st.divider()
+
 
 # --- Main Chat Interface ---
 
-# Initialize chat history in session state if it doesn't exist
+# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Display past chat messages
+# Display chat messages from history
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        # Display sources associated with previous assistant messages
+        # Display sources if they exist for an assistant message
         if message["role"] == "assistant" and "sources" in message and message["sources"]:
-            with st.expander("Show sources used"):
+            # Use the unique message ID stored with the message for the expander key
+            with st.expander("Show sources used", key=f"expander_{message['id']}"):
                 for i, doc in enumerate(message["sources"]):
                     source = doc.metadata.get('source', 'N/A')
                     country = doc.metadata.get('country', 'N/A')
                     year = doc.metadata.get('year', '')
                     chunk_idx = doc.metadata.get('chunk_index', '')
                     label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
-                    # Use unique key based on message ID and index
+                    # Use unique key based on message ID and source index
                     source_key = f"src_hist_{message['id']}_{i}"
                     st.text_area(label, doc.page_content, height=100, key=source_key)
 
 
-# Get user input using chat_input
-if prompt := st.chat_input("Ask a question about the documents..."):
-    # Add user message to history and display it
-    st.session_state.messages.append({"role": "user", "content": prompt, "id": str(uuid.uuid4())})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+# Get user input
+if prompt := st.chat_input("Ask a question about the documents..." if status_ok else "System not fully ready..."):
+    if not status_ok:
+        st.warning("Please wait for all system components to initialize (check sidebar).")
+    else:
+        # Add user message to history and display it
+        user_msg_id = str(uuid.uuid4())
+        st.session_state.messages.append({"role": "user", "content": prompt, "id": user_msg_id})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-    # Get assistant response and display it
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        message_placeholder.markdown("Thinking...")
-        answer, sources = get_rag_response(prompt) # RAG function call
-        message_placeholder.markdown(answer)
+        # Get and display assistant response
+        with st.chat_message("assistant"):
+            # Use a placeholder for the "Thinking..." message and final answer
+            response_placeholder = st.empty()
+            response_placeholder.markdown("Thinking...")
 
-        # Display sources for *this* response in an expander
-        if sources:
-            with st.expander("Show sources used for this response"):
-                for i, doc in enumerate(sources):
-                     source = doc.metadata.get('source', 'N/A')
-                     country = doc.metadata.get('country', 'N/A')
-                     year = doc.metadata.get('year', '')
-                     chunk_idx = doc.metadata.get('chunk_index', '')
-                     label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
-                     # Use unique key based on current prompt and index
-                     source_key = f"src_curr_{len(st.session_state.messages)}_{i}"
-                     st.text_area(label, doc.page_content, height=100, key=source_key)
+            # Call the RAG function
+            answer, sources = get_rag_response(prompt)
 
+            # Update placeholder with the actual answer
+            response_placeholder.markdown(answer)
 
-    # Add assistant response and sources to history
-    # Generate a unique ID for message keying
-    msg_id = str(uuid.uuid4())
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": answer,
-        "sources": sources,
-        "id": msg_id
-        })
+            # Display sources in an expander if they exist
+            if sources:
+                # Use a unique key for the expander based on the latest message count
+                expander_key = f"expander_curr_{len(st.session_state.messages)}"
+                with st.expander("Show sources used for this response", key=expander_key):
+                    for i, doc in enumerate(sources):
+                         source = doc.metadata.get('source', 'N/A')
+                         country = doc.metadata.get('country', 'N/A')
+                         year = doc.metadata.get('year', '')
+                         chunk_idx = doc.metadata.get('chunk_index', '')
+                         label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
+                         # Use unique key based on current message count and index
+                         source_key = f"src_curr_{len(st.session_state.messages)}_{i}"
+                         st.text_area(label, doc.page_content, height=100, key=source_key)
+
+        # Add assistant response and sources to chat history
+        asst_msg_id = str(uuid.uuid4())
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+            "id": asst_msg_id # Store unique ID with the message
+            })
