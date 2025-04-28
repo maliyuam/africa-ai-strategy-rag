@@ -45,18 +45,18 @@ LLM_MODEL = "gpt-4o-mini"
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 # Re-ranking constants
-INITIAL_RETRIEVAL_K = 20
-FINAL_RANKED_K = 5
+INITIAL_RETRIEVAL_K = 50
+FINAL_RANKED_K = 30
+# Memory constants
+CONVERSATION_HISTORY_LENGTH = 15 # Number of user/assistant turn pairs to include
+# Other constants
 CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
-# OCR constants
 OCR_LANGUAGES = ['en']
 OCR_MIN_TEXT_LENGTH = 50
 
-# --- Caching Expensive Initializations ---
-
+# --- Caching Expensive Initializations --- (No changes needed here) ---
 @st.cache_resource(show_spinner="Connecting to MongoDB...")
 def get_mongo_client(uri):
-    # (Unchanged)
     try:
         client = MongoClient(uri, serverSelectionTimeoutMS=5000)
         client.admin.command('ping')
@@ -70,10 +70,9 @@ def get_mongo_client(uri):
 
 @st.cache_resource(show_spinner="Initializing AI Components...")
 def initialize_openai_langchain(api_key):
-    # (Unchanged)
     try:
         if not api_key: raise ValueError("OpenAI API Key is empty.")
-        llm = ChatOpenAI(openai_api_key=api_key, model_name=LLM_MODEL, temperature=0.1)
+        llm = ChatOpenAI(openai_api_key=api_key, model_name=LLM_MODEL, temperature=0.1, request_timeout=120)
         embeddings = OpenAIEmbeddings(openai_api_key=api_key, model=EMBEDDING_MODEL)
         openai_client = OpenAI(api_key=api_key)
         return llm, embeddings, openai_client
@@ -83,7 +82,6 @@ def initialize_openai_langchain(api_key):
 
 @st.cache_resource(show_spinner="Connecting to Vector Store...")
 def get_vector_store(_mongo_client, _embeddings):
-    # (Unchanged)
     if _mongo_client is None or _embeddings is None:
         st.error("Cannot initialize Vector Store: Dependencies missing.")
         return None
@@ -102,7 +100,6 @@ def get_vector_store(_mongo_client, _embeddings):
 
 @st.cache_resource(show_spinner="Loading Re-ranking Model...")
 def get_cross_encoder(model_name=CROSS_ENCODER_MODEL):
-    # (Unchanged)
     """Loads the CrossEncoder model and caches it."""
     try:
         model = CrossEncoder(model_name)
@@ -113,7 +110,6 @@ def get_cross_encoder(model_name=CROSS_ENCODER_MODEL):
 
 @st.cache_resource(show_spinner="Loading OCR Model...")
 def get_easyocr_reader(langs=OCR_LANGUAGES, gpu=False):
-    # (Unchanged - kept for completeness if needed later)
     """Loads the EasyOCR reader and caches it."""
     try:
         reader = easyocr.Reader(langs, gpu=gpu)
@@ -127,12 +123,9 @@ mongo_client = get_mongo_client(MONGO_URI)
 llm, embeddings, openai_client = initialize_openai_langchain(OPENAI_API_KEY)
 vector_store = get_vector_store(mongo_client, embeddings)
 cross_encoder = get_cross_encoder()
-easyocr_reader = get_easyocr_reader() # Initialize even if not used in UI
+easyocr_reader = get_easyocr_reader()
 
-# --- Helper Functions ---
-# (Functions extract_text_from_pdf_stream, chunk_text, process_and_store_pdf
-#  are kept here, even though not called by the UI,
-#  in case you want to re-enable uploads later or use them differently)
+# --- Helper Functions --- (No changes needed in extract/chunk/process funcs) ---
 def extract_text_from_pdf_stream(pdf_stream):
     """
     Extracts text from a PDF file stream.
@@ -143,7 +136,7 @@ def extract_text_from_pdf_stream(pdf_stream):
     tmp_pdf_path = None
 
     if easyocr_reader is None:
-        st.warning("EasyOCR reader not loaded. OCR functionality will be skipped.")
+        st.warning("EasyOCR reader not loaded. OCR functionality will be skipped for images.")
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpfile:
@@ -158,39 +151,42 @@ def extract_text_from_pdf_stream(pdf_stream):
         page_texts = []
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            page_text = page.get_text("text").strip()
+            page_text = page.get_text("text", sort=True).strip() # Added sort=True for better reading order
 
             if easyocr_reader and (not page_text or len(page_text) < OCR_MIN_TEXT_LENGTH):
                 ocr_attempted_for_page = False
                 try:
-                    # st.write(f"Page {page_num+1}: Low text detected, attempting OCR...") # Debug info removed for cleaner output
-                    pix = page.get_pixmap(dpi=300)
+                    pix = page.get_pixmap(dpi=300) # Higher DPI for better OCR
                     img_bytes = pix.tobytes("png")
                     pil_image = Image.open(io.BytesIO(img_bytes))
                     np_image = np.array(pil_image)
                     ocr_results = easyocr_reader.readtext(np_image)
                     ocr_attempted_for_page = True
                     ocr_text = " ".join([res[1] for res in ocr_results])
-                    if ocr_text.strip():
-                        page_texts.append(ocr_text.strip())
-                        ocr_pages_count += 1
-                        # st.write(f"Page {page_num+1}: OCR successful.") # Debug info removed
+
+                    if ocr_text.strip() and len(ocr_text.strip()) > len(page_text):
+                         if page_text:
+                             page_texts.append(page_text + "\n<OCR_TEXT>\n" + ocr_text.strip())
+                         else:
+                            page_texts.append(ocr_text.strip())
+                         ocr_pages_count += 1
                     elif page_text:
                         page_texts.append(page_text)
+
                 except Exception as ocr_err:
-                     st.warning(f"OCR failed for page {page_num + 1}: {ocr_err}. Falling back to get_text() if available.")
+                     st.warning(f"OCR failed for page {page_num + 1}: {ocr_err}. Using only text from get_text() if available.")
                      if page_text:
                          page_texts.append(page_text)
-            else:
+            elif page_text:
                 page_texts.append(page_text)
 
         doc.close()
         os.remove(tmp_pdf_path)
 
-        full_doc_text = "\n\n".join(filter(None, page_texts))
+        full_doc_text = "\n\n".join(filter(None, page_texts)) # Join pages
 
         if ocr_pages_count > 0:
-            st.info(f"Used OCR to extract text from {ocr_pages_count} page(s).")
+            st.info(f"Used OCR to potentially enhance text extraction from {ocr_pages_count} page(s).")
 
         if not full_doc_text.strip():
              st.warning("Extracted text is empty or only whitespace after processing.")
@@ -224,123 +220,107 @@ def chunk_text(text, chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP):
         st.error(f"Error during text chunking: {e}")
         return []
 
-def process_and_store_pdf(pdf_stream, filename, country, year=None, source_url=None):
-    """Processes an uploaded PDF stream and stores it."""
-    # This function is currently unused by the UI but kept for completeness
-    if not vector_store:
-        st.error("Vector Store not initialized. Cannot process PDF.")
-        return False
-
-    status_placeholder = st.sidebar.empty()
-    progress_bar = st.sidebar.progress(0, text="Starting...")
-    try:
-        status_placeholder.info(f"Processing '{filename}'...")
-        progress_bar.progress(5, text="Extracting text (incl. OCR)...")
-        with st.spinner("Extracting text (incl. OCR)..."):
-            full_text = extract_text_from_pdf_stream(pdf_stream)
-
-        if full_text is None:
-            status_placeholder.error("Text extraction failed."); progress_bar.empty(); return False
-        if not full_text:
-             st.warning(f"No text found in '{filename}'. Skipping storage.")
-             status_placeholder.empty(); progress_bar.empty(); return False
-
-        progress_bar.progress(20, text="Chunking text...")
-        text_chunks = chunk_text(full_text)
-        if not text_chunks:
-            st.error("No text chunks generated."); status_placeholder.empty(); progress_bar.empty(); return False
-
-        progress_bar.progress(30, text="Preparing documents...")
-        documents = []
-        for i, chunk in enumerate(text_chunks):
-            metadata = { "source": filename, "country": country.strip(), "chunk_index": i, "year": year, "source_url": source_url }
-            filtered_metadata = {k: v for k, v in metadata.items() if v is not None}
-            documents.append(Document(page_content=chunk, metadata=filtered_metadata))
-
-        if not documents:
-            st.error("No documents created."); status_placeholder.empty(); progress_bar.empty(); return False
-
-        progress_bar.progress(40, text=f"Embedding & storing {len(documents)} chunks...")
-        with st.spinner(f"Adding {len(documents)} chunks to Vector Store..."):
-            batch_size = 50
-            inserted_ids = []
-            total_docs = len(documents)
-            for i in range(0, total_docs, batch_size):
-                 batch = documents[i:i + batch_size]
-                 ids = vector_store.add_documents(batch)
-                 inserted_ids.extend(ids)
-                 progress_percentage = min(40 + int(((i + len(batch)) / total_docs) * 60), 100)
-                 progress_text = f"Embedding & Storing Chunks... {progress_percentage}%"
-                 progress_bar.progress(progress_percentage / 100, text=progress_text)
-
-        st.sidebar.success(f"Processed '{filename}' ({len(inserted_ids)} chunks).")
-        progress_bar.empty(); status_placeholder.empty()
-        st.spinner()
-        return True
-
-    except Exception as e:
-        st.error(f"Error processing/storing PDF: {e}"); st.exception(e)
-        status_placeholder.empty()
-        if 'progress_bar' in locals(): progress_bar.empty()
-        st.spinner()
-        return False
-
-# --- Enhanced Custom Prompt Template ---
+# --- Prompt Template with History ---
 prompt_template = """
-You are a highly specialized AI assistant expert in analyzing and synthesizing information from African AI and ICT strategy documents. Your primary function is to answer questions accurately and concisely based *exclusively* on the provided context. Maintain a professional and objective tone.
+You are a highly specialized AI assistant expert in analyzing and synthesizing information from African AI and ICT strategy documents. Your primary function is to answer questions accurately and concisely based *exclusively* on the provided context, considering the recent chat history for context. Maintain a professional and objective tone.
 
-Context:
+Chat History (Recent Turns):
+--- BEGIN HISTORY ---
+{chat_history}
+--- END HISTORY ---
+
+Retrieved Context from Documents:
 --- BEGIN CONTEXT ---
 {context}
 --- END CONTEXT ---
+**(Note: The context may contain text in languages other than English.)**
 
-Question: {question}
+Current Question: {question}
 
 Instructions for answering:
-1.  **Analyze the Context Thoroughly:** Carefully read all provided context chunks between the BEGIN and END markers.
-2.  **Answer ONLY from Context:** Base your entire answer *strictly* on the information found within the provided context. Do NOT use any external knowledge or make assumptions beyond what is explicitly stated in the text.
-3.  **Synthesize if Necessary:** If multiple context chunks provide relevant pieces of information, synthesize them into a coherent and unified answer. Avoid simply listing separate snippets unless the question specifically asks for distinct points.
-4.  **Direct Answer & Evidence:** Start with a direct answer to the question if possible. Support your answer by referencing the key information or evidence found in the context. Do not quote long passages unless the question requires it.
-5.  **Handle Insufficient Information:**
-    * If the context is relevant but does *not* fully answer the question, clearly state what information *is* available in the context and explicitly mention what parts of the question cannot be answered based on the provided text.
-    * If the context does *not* contain *any* relevant information to answer the question, state clearly: "Based on the provided documents, I cannot answer this question."
-6.  **Handle Conflicting Information:** If different parts of the context present conflicting information, acknowledge this discrepancy as found within the text.
-7.  **Conciseness and Clarity:** Be clear and concise. Avoid jargon where possible or explain it using the context if necessary. Structure the answer logically.
+1.  **Review History:** Consider the recent `Chat History` to understand the background and flow of the conversation, especially if the `Current Question` refers to previous points (e.g., using 'it', 'that', 'those').
+2.  **Analyze Context:** Carefully read all provided `Retrieved Context` chunks between the BEGIN and END markers. This context from the documents is the primary source for your answer's factual content.
+3.  **Prioritize Retrieved Context:** Base your answer *primarily* on the information found within the `Retrieved Context`. Use the `Chat History` mainly to interpret the `Current Question` correctly.
+4.  **Answer ONLY from Retrieved Context:** Your answer's substance must come *strictly* from the `Retrieved Context`. Do NOT use information *only* present in the `Chat History` as the factual basis for your answer, unless it's defining the current question itself. Do NOT use external knowledge or make assumptions.
+5.  **Synthesize if Necessary:** If multiple context chunks provide relevant pieces of information, synthesize them into a coherent and unified answer based on the retrieved context.
+6.  **Direct Answer & Evidence:** Start with a direct answer to the question based on the retrieved context if possible. Support your answer by referencing the key information or evidence found in the context.
+7.  **Handle Insufficient Retrieved Context:**
+    * If the retrieved context is relevant but does *not* fully answer the question, clearly state what information *is* available in the context and explicitly mention what parts of the question cannot be answered based on the provided documents.
+    * If the retrieved context does *not* contain *any* relevant information to answer the question (even considering the chat history for question interpretation), state clearly: "Based on the provided documents, I cannot answer this question."
+8.  **Handle Conflicting Retrieved Context:** If different parts of the retrieved context present conflicting information, acknowledge this discrepancy as found within the provided text.
+9.  **Ensure English Output:** Regardless of the original language(s) in the context, formulate and write your entire final answer exclusively in **English**.
+10. **Do Not Add Citation Numbers:** Do not add bracketed citation numbers like [1], [2] within your answer text. Focus solely on answering the question based on the provided context.
 
 Answer:"""
 CUSTOM_PROMPT = PromptTemplate(
-    template=prompt_template, input_variables=["context", "question"]
+    template=prompt_template, input_variables=["chat_history", "context", "question"] # Added chat_history
 )
 
-# --- RAG Function (incorporates re-ranking) ---
-def get_rag_response(query):
-    """Performs RAG, Re-ranking, and LLM call."""
+# --- RAG Function (incorporates re-ranking and history) ---
+def get_rag_response(query: str, chat_history: str): # Added chat_history parameter
+    """Performs RAG, Re-ranking, and LLM call, considering chat history."""
     if not all([vector_store, llm, cross_encoder]):
         missing = [comp_name for comp, comp_name in zip([vector_store, llm, cross_encoder], ["Vector Store", "LLM", "Re-ranker"]) if comp is None]
         return f"Error: Cannot perform query. Missing components: {', '.join(missing)}.", []
     try:
         with st.spinner(f"Searching for top {INITIAL_RETRIEVAL_K} candidates..."):
+            # Perform similarity search based on the current query
             initial_docs = vector_store.similarity_search(query, k=INITIAL_RETRIEVAL_K)
+
         if not initial_docs:
-            return "I couldn't find any potentially relevant documents based on your query.", []
-        with st.spinner(f"Re-ranking {len(initial_docs)} candidates..."):
+            try:
+                doc_count = vector_store.collection.count_documents({})
+                if doc_count == 0:
+                     return "The document collection appears to be empty. Please add documents.", []
+            except Exception:
+                pass
+            return "I couldn't find any relevant sections in the documents based on your query.", []
+
+        with st.spinner(f"Re-ranking {len(initial_docs)} candidates to select top {FINAL_RANKED_K}..."):
             rerank_pairs = [(query, doc.page_content) for doc in initial_docs]
             scores = cross_encoder.predict(rerank_pairs)
             docs_with_scores = sorted(zip(initial_docs, scores), key=lambda x: x[1], reverse=True)
             re_ranked_docs = [doc for doc, score in docs_with_scores[:FINAL_RANKED_K]]
 
+        if not re_ranked_docs:
+             return "Found some potentially relevant sections, but their relevance score was too low after re-ranking.", []
+
+        # Prepare context string from re-ranked documents
         context_str = "\n\n---\n\n".join([doc.page_content for doc in re_ranked_docs])
 
-        # Use the updated CUSTOM_PROMPT object
-        formatted_prompt = CUSTOM_PROMPT.format(context=context_str, question=query)
+        # Format the prompt with history, context, and question
+        formatted_prompt = CUSTOM_PROMPT.format(
+            chat_history=chat_history, # Pass formatted history
+            context=context_str,
+            question=query
+        )
 
-        with st.spinner("Generating answer..."):
+        with st.spinner(f"Generating answer in English based on {len(re_ranked_docs)} sources and history..."):
             response = llm.invoke(formatted_prompt)
             answer = response.content
+
         return answer, re_ranked_docs
     except Exception as e:
         st.error(f"An error occurred during the RAG process: {e}"); st.exception(e)
+        if "context length" in str(e).lower():
+             st.warning(f"The context might be too long for the LLM ({LLM_MODEL}). Consider reducing FINAL_RANKED_K (currently {FINAL_RANKED_K}) or CONVERSATION_HISTORY_LENGTH (currently {CONVERSATION_HISTORY_LENGTH}).")
         return "Sorry, an error occurred while processing your request.", []
+
+# --- Helper Function to Format History ---
+def format_chat_history(messages: list, k: int = CONVERSATION_HISTORY_LENGTH) -> str:
+    """Formats the last k turns of chat history for the prompt."""
+    if not messages:
+        return "No history yet."
+
+    # Get the last k * 2 messages (k user + k assistant turns)
+    history_messages = messages[-(k*2):]
+
+    formatted_history = []
+    for msg in history_messages:
+        role = "Human" if msg["role"] == "user" else "AI"
+        formatted_history.append(f"{role}: {msg['content']}")
+
+    return "\n".join(formatted_history)
 
 
 # --- UI Components ---
@@ -360,19 +340,17 @@ with st.sidebar:
     else: st.error("Vector Store Failed"); status_ok = False
     if cross_encoder: st.success("Re-ranker Loaded")
     else: st.error("Re-ranker Failed"); status_ok = False
-    if easyocr_reader: st.success("EasyOCR Reader Loaded") # Kept status for info
-    else: st.warning("EasyOCR Reader Failed / Not Used") # Changed to warning
+    if easyocr_reader: st.success("EasyOCR Reader Loaded")
+    else: st.warning("EasyOCR Reader Failed / Not Used")
     st.divider()
     st.subheader("Configuration")
     if embeddings: st.write(f"**Embedding:** `{EMBEDDING_MODEL}`")
     if llm: st.write(f"**LLM:** `{LLM_MODEL}`")
     if cross_encoder: st.write(f"**Re-ranker:** `{CROSS_ENCODER_MODEL}`")
-    # if easyocr_reader: st.write(f"**OCR Languages:** `{OCR_LANGUAGES}`") # Can hide this if not used
+    st.write(f"**Context Chunks:** `{FINAL_RANKED_K}` (From top {INITIAL_RETRIEVAL_K})")
+    st.write(f"**History Length:** `{CONVERSATION_HISTORY_LENGTH}` turns")
     st.divider()
     st.info("Database is updated via external process (e.g., Colab notebook).")
-
-# --- Removed Sidebar PDF Upload Section ---
-
 
 # --- Main Chat Interface ---
 
@@ -389,16 +367,16 @@ for message in st.session_state.messages:
             message_id = message.get("id")
             if message_id:
                 # FIX 1 applied: Removed key argument
-                with st.expander("Show sources used"):
+                with st.expander(f"Show Sources Used ({len(message['sources'])}):"):
                     for i, doc in enumerate(message["sources"]):
                         source = doc.metadata.get('source', 'N/A')
                         country = doc.metadata.get('country', 'N/A')
                         year = doc.metadata.get('year', '')
                         chunk_idx = doc.metadata.get('chunk_index', '')
-                        label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
-                        # Use unique key for text_area based on message ID and source index
+                        # Updated Label for Citation Style
+                        label = f"[{i+1}] Src: {source} | Ctry: {country} | Yr: {year} | Chunk: {chunk_idx}"
                         source_key = f"src_hist_{message_id}_{i}"
-                        st.text_area(label, doc.page_content, height=100, key=source_key)
+                        st.text_area(label, doc.page_content, height=100, key=source_key, help="Original content from the source document.")
 
 
 # Get user input using chat_input
@@ -406,19 +384,24 @@ if prompt := st.chat_input("Ask a question about the documents..." if status_ok 
     if not status_ok:
         st.warning("Please wait for all system components to initialize (check sidebar).")
     else:
-        # Add user message to history and display it
+        # Add user message to history and display it FIRST
         user_msg_id = str(uuid.uuid4())
         st.session_state.messages.append({"role": "user", "content": prompt, "id": user_msg_id})
         with st.chat_message("user"):
             st.markdown(prompt)
 
+        # Prepare history FOR the RAG call (excluding the current prompt itself)
+        history_for_prompt = format_chat_history(st.session_state.messages[:-1]) # Pass all messages *before* the current one
+
         # Get and display assistant response
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             response_placeholder.markdown("Thinking...")
-            answer, sources = get_rag_response(prompt) # RAG function call
 
-            # --- Generate unique ID for this assistant message *before* creating UI elements ---
+            # Call RAG function with current prompt and formatted history
+            answer, sources = get_rag_response(prompt, history_for_prompt)
+
+            # Generate unique ID for this assistant message
             asst_msg_id = str(uuid.uuid4())
 
             # Update placeholder with the actual answer
@@ -427,23 +410,23 @@ if prompt := st.chat_input("Ask a question about the documents..." if status_ok 
             # Display sources for *this* response in an expander
             if sources:
                 # FIX 2 applied: Removed key argument
-                with st.expander("Show sources used for this response"):
+                with st.expander(f"Show Sources Used for this Response ({len(sources)}):"):
                     for i, doc in enumerate(sources):
                         source = doc.metadata.get('source', 'N/A')
                         country = doc.metadata.get('country', 'N/A')
                         year = doc.metadata.get('year', '')
                         chunk_idx = doc.metadata.get('chunk_index', '')
-                        label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
-                        # Use unique key for text_area based on message ID and source index
+                        # Updated Label for Citation Style
+                        label = f"[{i+1}] Src: {source} | Ctry: {country} | Yr: {year} | Chunk: {chunk_idx}"
                         source_key = f"src_{asst_msg_id}_{i}"
-                        st.text_area(label, doc.page_content, height=100, key=source_key)
+                        st.text_area(label, doc.page_content, height=100, key=source_key, help="Original content from the source document.")
 
-        # Add assistant response and sources to chat history (using the same ID)
+        # Add assistant response and sources to chat history AFTER generating it
         st.session_state.messages.append({
             "role": "assistant",
             "content": answer,
             "sources": sources,
             "id": asst_msg_id
             })
-        # Optional: uncomment rerun if needed, but test first
+        # Optional: rerun may cause state issues with expanders/history display
         st.rerun()
