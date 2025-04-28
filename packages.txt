@@ -1,5 +1,5 @@
-# packages.txt
+# System packages required for Tesseract OCR
 tesseract-ocr
 libtesseract-dev
-tesseract-ocr-eng # For English language pack
+tesseract-ocr-eng
 tesseract-ocr-fra
