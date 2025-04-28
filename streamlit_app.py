@@ -2,15 +2,21 @@ import streamlit as st
 import os
 import pymongo
 from pymongo import MongoClient
-# Removed fitz, io, numpy, PIL.Image, easyocr, tempfile, text_splitter, Document imports as they are for ingestion
+import fitz  # PyMuPDF
+import io # For handling image bytes
+import numpy as np # For image array conversion
+from PIL import Image # For image handling
+import easyocr # Import EasyOCR
 from openai import OpenAI
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_mongodb import MongoDBAtlasVectorSearch
-# Removed RetrievalQA import
+from langchain_core.documents import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.prompts import PromptTemplate
-from sentence_transformers import CrossEncoder # Still needed for re-ranking
+from sentence_transformers import CrossEncoder # Import for re-ranking
 from dotenv import load_dotenv
-import pandas # Often useful with Streamlit
+import tempfile
+import pandas
 import uuid # To generate unique keys for messages
 
 # --- Configuration & Secrets ---
@@ -18,7 +24,7 @@ load_dotenv()
 
 st.set_page_config(page_title="African AI Strategies Chat", layout="wide")
 st.title("💬 African AI & ICT Strategies Chatbot")
-st.caption("Chat about AI/ICT strategies (Re-ranking Accuracy | DB updated via Colab)") # Updated caption
+st.caption("Chat about AI/ICT strategies (Handles Scanned PDFs | Re-ranking Accuracy | DB updated via Colab)") # Updated caption
 
 # Secrets Management
 try:
@@ -36,18 +42,20 @@ COLLECTION_NAME = "strategy_documents"
 VECTOR_INDEX_NAME = "vector_index"
 EMBEDDING_MODEL = "text-embedding-3-small"
 LLM_MODEL = "gpt-4o-mini"
-# Removed CHUNK constants as chunking is handled elsewhere
+CHUNK_SIZE = 1000 # Define even if chunking happens elsewhere, might be useful reference
+CHUNK_OVERLAP = 150 # Define even if chunking happens elsewhere
 # Re-ranking constants
 INITIAL_RETRIEVAL_K = 20
 FINAL_RANKED_K = 5
 CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
-# Removed OCR constants
+# OCR constants
+OCR_LANGUAGES = ['en']
+OCR_MIN_TEXT_LENGTH = 50 # Define even if ingestion is elsewhere
 
 # --- Caching Expensive Initializations ---
 
 @st.cache_resource(show_spinner="Connecting to MongoDB...")
 def get_mongo_client(uri):
-    # (Unchanged)
     try:
         client = MongoClient(uri, serverSelectionTimeoutMS=5000)
         client.admin.command('ping')
@@ -61,7 +69,6 @@ def get_mongo_client(uri):
 
 @st.cache_resource(show_spinner="Initializing AI Components...")
 def initialize_openai_langchain(api_key):
-    # (Unchanged)
     try:
         if not api_key: raise ValueError("OpenAI API Key is empty.")
         llm = ChatOpenAI(openai_api_key=api_key, model_name=LLM_MODEL, temperature=0.1)
@@ -74,7 +81,6 @@ def initialize_openai_langchain(api_key):
 
 @st.cache_resource(show_spinner="Connecting to Vector Store...")
 def get_vector_store(_mongo_client, _embeddings):
-    # (Unchanged)
     if _mongo_client is None or _embeddings is None:
         st.error("Cannot initialize Vector Store: Dependencies missing.")
         return None
@@ -93,7 +99,7 @@ def get_vector_store(_mongo_client, _embeddings):
 
 @st.cache_resource(show_spinner="Loading Re-ranking Model...")
 def get_cross_encoder(model_name=CROSS_ENCODER_MODEL):
-    # (Unchanged)
+    """Loads the CrossEncoder model and caches it."""
     try:
         model = CrossEncoder(model_name)
         return model
@@ -101,9 +107,10 @@ def get_cross_encoder(model_name=CROSS_ENCODER_MODEL):
         st.error(f"Error loading CrossEncoder model '{model_name}': {e}")
         return None
 
-# --- Removed EasyOCR Reader Initialization ---
-# @st.cache_resource(...)
+# Removed EasyOCR loader as ingestion is external
+# @st.cache_resource(show_spinner="Loading OCR Model...")
 # def get_easyocr_reader(...): ...
+
 
 # --- Initialize Clients ---
 mongo_client = get_mongo_client(MONGO_URI)
@@ -113,12 +120,12 @@ cross_encoder = get_cross_encoder()
 # Removed easyocr_reader initialization
 
 # --- Removed Helper Functions for Ingestion ---
-# def extract_text_from_pdf_stream(...): ...
-# def chunk_text(...): ...
-# def process_and_store_pdf(...): ...
+# def extract_text_from_pdf_stream(...): ... # (Depends on fitz, Pillow, easyocr)
+# def chunk_text(...): ... # (Depends on RecursiveCharacterTextSplitter)
+# def process_and_store_pdf(...): ... # (Calls above functions)
+
 
 # --- Custom Prompt Template ---
-# (Unchanged)
 prompt_template = """
 You are an AI assistant specialized in analyzing African AI and ICT strategy documents.
 Use the following pieces of context retrieved from the documents to answer the question at the end.
@@ -138,35 +145,53 @@ CUSTOM_PROMPT = PromptTemplate(
 )
 
 # --- RAG Function (incorporates re-ranking) ---
-# (Unchanged)
 def get_rag_response(query):
     """Performs RAG, Re-ranking, and LLM call."""
+    # Check if all required components are loaded for querying
     if not all([vector_store, llm, cross_encoder]):
-        missing = [comp_name for comp, comp_name in zip([vector_store, llm, cross_encoder], ["Vector Store", "LLM", "Re-ranker"]) if comp is None]
+        missing = [
+            comp_name for comp, comp_name in
+            zip([vector_store, llm, cross_encoder], ["Vector Store", "LLM", "Re-ranker"])
+            if comp is None
+        ]
         return f"Error: Cannot perform query. Missing components: {', '.join(missing)}.", []
+
     try:
+        # 1. Initial Retrieval
         with st.spinner(f"Searching for top {INITIAL_RETRIEVAL_K} candidates..."):
             initial_docs = vector_store.similarity_search(query, k=INITIAL_RETRIEVAL_K)
+
         if not initial_docs:
             return "I couldn't find any potentially relevant documents based on your query.", []
+
+        # 2. Re-ranking
         with st.spinner(f"Re-ranking {len(initial_docs)} candidates..."):
             rerank_pairs = [(query, doc.page_content) for doc in initial_docs]
             scores = cross_encoder.predict(rerank_pairs)
             docs_with_scores = sorted(zip(initial_docs, scores), key=lambda x: x[1], reverse=True)
             re_ranked_docs = [doc for doc, score in docs_with_scores[:FINAL_RANKED_K]]
+
+        # 3. Prepare Context & Prompt
         context_str = "\n\n---\n\n".join([doc.page_content for doc in re_ranked_docs])
         formatted_prompt = CUSTOM_PROMPT.format(context=context_str, question=query)
+
+        # 4. Call LLM
         with st.spinner("Generating answer..."):
             response = llm.invoke(formatted_prompt)
             answer = response.content
+
+        # Return answer and the re-ranked documents used
         return answer, re_ranked_docs
+
     except Exception as e:
-        st.error(f"An error occurred during the RAG process: {e}"); st.exception(e)
+        st.error(f"An error occurred during the RAG process: {e}")
+        st.exception(e)
         return "Sorry, an error occurred while processing your request.", []
+
 
 # --- UI Components ---
 
-# Sidebar Status and Config Display (Removed OCR status/config)
+# Sidebar Status and Config Display
 with st.sidebar:
     st.divider()
     st.subheader("System Status")
@@ -189,16 +214,12 @@ with st.sidebar:
     if cross_encoder: st.write(f"**Re-ranker:** `{CROSS_ENCODER_MODEL}`")
     # Removed OCR info
     st.divider()
-    st.info("Database is updated via external process (e.g., Colab notebook).") # Added info message
+    st.info("Database is updated via external process (e.g., Colab notebook).")
 
 # --- Removed Sidebar PDF Upload Section ---
-# with st.sidebar:
-#    st.header("📄 Add New Document")
-#    ... (all upload widgets and logic removed) ...
 
 
 # --- Main Chat Interface ---
-# (Unchanged from previous version)
 
 # Initialize chat history
 if "messages" not in st.session_state:
@@ -210,24 +231,30 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
         # Display sources associated with previous assistant messages
         if message["role"] == "assistant" and "sources" in message and message["sources"]:
-            with st.expander("Show sources used", key=f"expander_{message['id']}"):
-                for i, doc in enumerate(message["sources"]):
-                    source = doc.metadata.get('source', 'N/A')
-                    country = doc.metadata.get('country', 'N/A')
-                    year = doc.metadata.get('year', '')
-                    chunk_idx = doc.metadata.get('chunk_index', '')
-                    label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
-                    source_key = f"src_hist_{message['id']}_{i}"
-                    st.text_area(label, doc.page_content, height=100, key=source_key)
+            # --- Includes the fix for the expander key ---
+            message_id = message.get("id") # Safely get ID
+            if message_id: # Only show expander if message has an ID
+                expander_key = f"expander_{message_id}"
+                with st.expander("Show sources used", key=expander_key):
+                    for i, doc in enumerate(message["sources"]):
+                        source = doc.metadata.get('source', 'N/A')
+                        country = doc.metadata.get('country', 'N/A')
+                        year = doc.metadata.get('year', '')
+                        chunk_idx = doc.metadata.get('chunk_index', '')
+                        label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
+                        source_key = f"src_hist_{message_id}_{i}" # Use message_id in key
+                        st.text_area(label, doc.page_content, height=100, key=source_key)
+            # else: # Optional: indicate if sources can't be shown due to missing ID
+            #     st.caption("[Sources unavailable for this older message]")
 
 
 # Get user input using chat_input
-if prompt := st.chat_input("Ask a question about the documents..." if status_ok else "System not fully ready..."):
+if prompt := st.chat_input("Ask a question about the documents..." if status_ok else "System initializing..."):
     if not status_ok:
         st.warning("Please wait for all system components to initialize (check sidebar).")
     else:
         # Add user message to history and display it
-        user_msg_id = str(uuid.uuid4())
+        user_msg_id = str(uuid.uuid4()) # Generate unique ID
         st.session_state.messages.append({"role": "user", "content": prompt, "id": user_msg_id})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -241,8 +268,7 @@ if prompt := st.chat_input("Ask a question about the documents..." if status_ok 
 
             # Display sources for *this* response in an expander
             if sources:
-                # Use a unique key for the expander based on the latest message count
-                expander_key = f"expander_curr_{len(st.session_state.messages)}"
+                expander_key = f"expander_curr_{len(st.session_state.messages)}" # Key based on current state
                 with st.expander("Show sources used for this response", key=expander_key):
                     for i, doc in enumerate(sources):
                          source = doc.metadata.get('source', 'N/A')
@@ -250,11 +276,11 @@ if prompt := st.chat_input("Ask a question about the documents..." if status_ok 
                          year = doc.metadata.get('year', '')
                          chunk_idx = doc.metadata.get('chunk_index', '')
                          label = f"Source {i+1} | Src: {source} | Ctry: {country} | Yr: {year} | Idx: {chunk_idx}"
-                         source_key = f"src_curr_{len(st.session_state.messages)}_{i}"
+                         source_key = f"src_curr_{len(st.session_state.messages)}_{i}" # Unique key
                          st.text_area(label, doc.page_content, height=100, key=source_key)
 
-        # Add assistant response and sources to history
-        asst_msg_id = str(uuid.uuid4())
+        # Add assistant response and sources to chat history
+        asst_msg_id = str(uuid.uuid4()) # Generate unique ID
         st.session_state.messages.append({
             "role": "assistant",
             "content": answer,
